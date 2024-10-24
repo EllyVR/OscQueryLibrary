@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Net;
 using System.Net.Mime;
 using System.Net.Sockets;
@@ -6,10 +7,9 @@ using System.Text.Json;
 using MeaMod.DNS.Model;
 using MeaMod.DNS.Multicast;
 using Serilog;
-using EmbedIO;
-using EmbedIO.Actions;
 using OscQueryLibrary.Models;
 using OscQueryLibrary.Utils;
+using ILogger = Serilog.ILogger;
 
 namespace OscQueryLibrary;
 
@@ -39,13 +39,11 @@ public class OscQueryServer : IDisposable
     
     
     private readonly Dictionary<string, object?> _parameterList = new();
-
-    private readonly WebServer _httpServer;
+    private readonly HttpListener _httpListener;
     private readonly string _httpServerUrl;
 
     public OscQueryServer(string serviceName, IPAddress ipAddress)
     {
-        Swan.Logging.Logger.NoLogging();
 
         _serviceName = serviceName;
         _ipAddress = ipAddress;
@@ -57,15 +55,14 @@ public class OscQueryServer : IDisposable
 
         // HTTP Server
         _httpServerUrl = $"http://{_ipAddress}:{_httpPort}/";
-        _httpServer = new WebServer(o => o
-                .WithUrlPrefix(_httpServerUrl)
-                .WithMode(HttpListenerMode.EmbedIO))
-            .WithModule(new ActionModule("/", HttpVerbs.Get,
-                ctx => ctx.SendStringAsync(
-                    ctx.Request.RawUrl.Contains("HOST_INFO")
-                        ? JsonSerializer.Serialize(_hostInfo, ModelsSourceGenerationContext.Default.HostInfo!)
-                        : JsonSerializer.Serialize(_queryData, ModelsSourceGenerationContext.Default.RootNode!), MediaTypeNames.Application.Json, Encoding.UTF8)));
+        
 
+        _httpListener = new HttpListener();
+        var prefix = $"http://{_ipAddress}:{_httpPort}/";
+        _httpListener.Prefixes.Add(prefix);
+        _httpListener.Start();
+        _httpListener.BeginGetContext(OnHttpRequest, null);
+        
         // mDNS
         _multicastService = new MulticastService
         {
@@ -77,14 +74,43 @@ public class OscQueryServer : IDisposable
     
     public void Start()
     {
-        ErrorHandledTask.Run(() => _httpServer.RunAsync());
+        //ErrorHandledTask.Run(() => _httpServer.RunAsync());
         Logger.Information("HTTP Server listening at {Prefix}", _httpServerUrl);
         
         ListenForServices();
         _multicastService.Start();
         AdvertiseOscQueryServer();
     }
-
+    
+    private async void OnHttpRequest(IAsyncResult result)
+    {
+        var context = _httpListener.EndGetContext(result);
+        _httpListener.BeginGetContext(OnHttpRequest, null);
+        var request = context.Request;
+        var response = context.Response;
+        var path = request.Url?.AbsolutePath;
+        if (path == null || request.RawUrl == null)
+            return;
+        
+        if (!request.RawUrl.Contains("HOST_INFO") && path != "/")
+        {
+            response.StatusCode = 404;
+            response.StatusDescription = "Not Found";
+            response.Close();
+            return;
+        }
+        
+        Debug.WriteLine($"OSCQueryHttp request: {path}");
+        var json = JsonSerializer.Serialize(request.RawUrl.Contains("HOST_INFO") ? (object?)_hostInfo : _queryData);
+        // JsonConvert.SerializeObject(request.RawUrl.Contains("HOST_INFO") ? _hostInfo : _queryData);
+        response.Headers.Add("pragma:no-cache");
+        response.ContentType = "application/json";
+        var buffer = Encoding.UTF8.GetBytes(json);
+        response.ContentLength64 = buffer.Length;
+        await response.OutputStream.WriteAsync(buffer);
+        response.OutputStream.Close();
+    }
+    
     private void AdvertiseOscQueryServer()
     {
         var httpProfile =
